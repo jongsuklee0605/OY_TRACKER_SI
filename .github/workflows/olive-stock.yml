@@ -49,7 +49,7 @@ jobs:
         env:
           MODE: stock
           SHARD: ${{ matrix.shard }}
-          NOTIFY_NO_CHANGE: "0"    # 변화 없을 땐 슬랙 안 보냄
+          NOTIFY_NO_CHANGE: "0"    # 샤드별로는 안 보내고, 아래 report 잡이 한 번만 보냄
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_STOCK }}
           GOODS_NO_ALL: ${{ secrets.GOODS_NO }}
         run: |
@@ -66,9 +66,58 @@ jobs:
           export GOODS_NO
           python olive_monitor.py
 
+      - name: Upload result
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ matrix.shard }}
+          path: olive_stock_result.json
+          retention-days: 1
+          if-no-files-found: ignore
+
       - name: Save state
         if: success() && hashFiles('olive_stock_state.json') != ''
         uses: actions/cache/save@v4
         with:
           path: olive_stock_state.json
           key: olive-stock-s${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+  report:
+    needs: run
+    if: needs.run.result == 'success'   # 샤드가 하나라도 실패하면 '변경점 없음'을 보내지 않음
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: result-*
+          path: results
+
+      - name: 변경점 없음 알림 (한 번만)
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_STOCK }}
+        run: |
+          python3 - <<'EOF'
+          import glob, json, os, urllib.request
+          from datetime import datetime, timezone, timedelta
+
+          files = glob.glob("results/**/olive_stock_result.json", recursive=True)
+          rs = [json.load(open(f)) for f in files]
+          if not rs:
+              print("결과 없음"); raise SystemExit
+          if any(r["sent"] for r in rs):
+              print("이미 변화/실패 알림을 보냄 → 생략"); raise SystemExit
+
+          goods = sum(r["goods"] for r in rs)
+          checked = sum(r["checked"] for r in rs)
+          ts = datetime.now(timezone(timedelta(hours=9))).strftime("%m/%d %H:%M")
+          text = f"✅ [올리브영 재고 {ts}] 상품 {goods}개 체크했으나 변경점이 없습니다. (재고 확인 {checked}개)"
+
+          req = urllib.request.Request(
+              os.environ["SLACK_WEBHOOK_URL"],
+              data=json.dumps({"text": text}).encode("utf-8"),
+              headers={"Content-Type": "application/json"},
+          )
+          urllib.request.urlopen(req, timeout=15)
+          print("전송 완료")
+          EOF
