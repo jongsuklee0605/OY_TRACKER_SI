@@ -117,4 +117,417 @@ def post_slack(text):
 def send_slack(header, blocks):
     chunks, cur = [], header
     for b in blocks:
-        if
+        if len(cur) + len(b) > SLACK_CHUNK and cur != header:
+            chunks.append(cur)
+            cur = header
+        cur += "\n\n" + b
+    chunks.append(cur)
+    for c in chunks:
+        post_slack(c)
+        time.sleep(1)
+
+
+# ======================================================================
+# 랭킹
+# ======================================================================
+
+def collect_goods(page):
+    """페이지에 보이는 상품번호를 순서대로, 그리고 링크 글자(상품명 후보)를 수집"""
+    pairs = page.eval_on_selector_all("a[href*='goodsNo=']", "els => els.map(e => [e.href, (e.innerText || '').trim()])")
+    ids, names = [], {}
+    for href, text in pairs:
+        m = re.search(r"goodsNo=([A-Za-z0-9]+)", href)
+        if not m:
+            continue
+        g = m.group(1)
+        if g not in ids:
+            ids.append(g)
+        line = max(text.split("\n"), key=len).strip() if text else ""
+        if len(line) > len(names.get(g, "")):
+            names[g] = line[:60]
+    return ids, names
+
+
+def fetch_ranking(page, url):
+    """403이 와도 보안 확인이 자동 통과될 수 있으므로 기다려 보고, 실패하면 메인 페이지를 거쳐 재시도"""
+    last_err = None
+    for attempt in range(1, RANK_RETRY + 1):
+        try:
+            if attempt > 1:
+                log(f"랭킹 재시도 {attempt}/{RANK_RETRY} - 메인 페이지 경유")
+                try:
+                    page.goto(MAIN_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+                except Exception as e:
+                    log(f"메인 페이지 열기 실패(무시): {str(e)[:60]}")
+                page.wait_for_timeout(random.randint(3000, 6000))
+
+            resp = page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+            status = resp.status if resp else None
+
+            ids = []
+            for _ in range(15):
+                page.wait_for_timeout(1000)
+                ids, _ = collect_goods(page)
+                if ids:
+                    break
+            if not ids:
+                raise RuntimeError(f"HTTP {status}, 제목 '{page.title()[:30]}'")
+
+            for _ in range(4):
+                page.mouse.wheel(0, 4000)
+                page.wait_for_timeout(400)
+            ids, names = collect_goods(page)
+            if attempt > 1:
+                log(f"랭킹 재시도 {attempt}회차에 성공")
+            return ids, names
+        except Exception as e:
+            last_err = e
+            log(f"랭킹 시도 {attempt}/{RANK_RETRY} 실패: {str(e)[:80]}")
+    raise RuntimeError(str(last_err)[:100])
+
+
+def rank_text(r):
+    return f"{r}위" if r else "권 밖"
+
+
+def run_rank(page, prev):
+    rank_pages = parse_rank_urls()
+    log(f"[랭킹 모드] 상품 {len(GOODS)}개, 랭킹 {len(rank_pages)}개")
+
+    rankings, rank_names, fails = {}, {}, {}
+    for name, url in rank_pages:
+        try:
+            ids, names = fetch_ranking(page, url)
+            rankings[name] = ids
+            for g, n in names.items():
+                rank_names.setdefault(g, n)
+            log(f"랭킹 '{name}' 완료 ({len(ids)}개 상품 보임)")
+        except Exception as e:
+            fails[f"랭킹 '{name}'"] = str(e)[:100]
+            log(f"랭킹 '{name}' 최종 실패: {str(e)[:100]}")
+        time.sleep(random.uniform(1.0, 2.0))
+
+    stock_names = {g: v.get("name", "") for g, v in load_state(STOCK_STATE_FILE)["items"].items()}
+    old_items = prev["items"]
+
+    now_items, blocks = {}, []
+    for g in GOODS:
+        old = old_items.get(g, {})
+        old_ranks = old.get("ranks", {})
+        ranks, diffs = {}, []
+        for name, _ in rank_pages:
+            if name in rankings:
+                lst = rankings[name]
+                r = lst.index(g) + 1 if g in lst else None
+                ranks[name] = r
+                if g in old_items and old_ranks.get(name) != r:
+                    diffs.append(f"  · {name}: {rank_text(old_ranks.get(name))} → *{rank_text(r)}*")
+                elif g not in old_items and r:
+                    diffs.append(f"  · {name}: *{rank_text(r)}*")
+                elif ALWAYS:
+                    diffs.append(f"  · {name}: {rank_text(r)}")
+            else:
+                ranks[name] = old_ranks.get(name)
+        pname = stock_names.get(g) or old.get("name") or rank_names.get(g, "")
+        now_items[g] = {"name": pname, "ranks": ranks}
+        if diffs:
+            title = f"{pname} ({g})" if pname else g
+            blocks.append(title + "\n" + "\n".join(diffs) + f"\n  {detail_url(g)}")
+
+    # 오류: 새로 생긴 것만 알림, 복구되면 알림
+    prev_errors = prev["errors"]
+    err_lines = []
+    for k, msg in fails.items():
+        if k not in prev_errors:
+            err_lines.append(f"❗ {k} 확인 실패: {msg} (이전 순위 유지)")
+    for k in prev_errors:
+        if k not in fails and k.replace("랭킹 '", "").rstrip("'") in rankings:
+            err_lines.append(f"✅ {k} 다시 정상 확인됨")
+    if err_lines:
+        blocks.append("\n".join(err_lines))
+
+    ts = now_ts()
+    if blocks:
+        send_slack(f"📊 [올리브영 랭킹 {ts}] 순위 변동", blocks)
+    elif NOTIFY_NO_CHANGE:
+        in_rank = sum(1 for v in now_items.values() if any(v["ranks"].values()))
+        note = f" (확인 실패 중: {', '.join(fails)})" if fails else ""
+        post_slack(f"✅ [올리브영 랭킹 {ts}] 순위 변동 없음. 랭킹 내 상품 {in_rank}개{note}")
+    else:
+        log("변화 없음 (알림 생략)")
+
+    return {"items": now_items, "errors": fails}
+
+
+# ======================================================================
+# 재고
+# ======================================================================
+
+def clean_name(title):
+    t = (title or "").strip()
+    t = re.sub(r"\s*[|\-–—:]\s*(올리브영|OLIVE\s*YOUNG).*$", "", t, flags=re.I)
+    t = re.sub(r"^\[?(올리브영|OLIVE\s*YOUNG)\]?\s*[|\-–—:]?\s*", "", t, flags=re.I)
+    return t.strip()[:60]
+
+
+def get_name(page):
+    try:
+        og = page.evaluate("() => (document.querySelector('meta[property=\"og:title\"]') || {}).content || ''")
+    except Exception:
+        og = ""
+    return clean_name(og or page.title())
+
+
+def parse_options(text):
+    """옵션 패널의 글자에서 {옵션이름: 품절여부} 를 뽑는다."""
+    marker = "옵션을 선택해"
+    if marker in text:
+        rest = text.split(marker, 1)[1]
+        text = rest.split("\n", 1)[1] if "\n" in rest else ""
+    text = text.split("구매수량")[0]
+
+    rows, cur = [], None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if PRICE_RE.search(line) or NOISE_RE.search(line):
+            if cur is not None:
+                cur["lines"].append(line)
+        else:
+            cur = {"name": line, "lines": []}
+            rows.append(cur)
+
+    options = {}
+    for r in rows:
+        joined = " ".join(r["lines"])
+        if not PRICE_RE.search(joined):
+            continue
+        options[r["name"]] = ("품절" in joined) or ("재입고" in joined)
+    return options
+
+
+def read_options(page):
+    """옵션 상품이면 ({옵션: 품절여부}, 디버그글자), 옵션 없는 상품이면 None."""
+    loc = page.get_by_text("옵션을 선택해")
+    header = None
+    for i in range(min(loc.count(), 5)):
+        if loc.nth(i).is_visible():
+            header = loc.nth(i)
+            break
+    if header is None:
+        return None
+
+    def box_text():
+        box = header.locator("xpath=ancestor::*[contains(., '원')][1]")
+        return box.inner_text() if box.count() else ""
+
+    text = box_text()
+    options = parse_options(text)
+    if options:
+        return options, text[:80]
+
+    header.click()
+    page.wait_for_timeout(700)
+    text = box_text()
+    options = parse_options(text)
+    if options:
+        return options, text[:80]
+
+    body = page.inner_text("body")
+    return parse_options(body), text[:80]
+
+
+class NoStockInfo(Exception):
+    """페이지는 열렸지만 재고 상태를 판단할 수 없는 경우 (판매종료 등)"""
+    pass
+
+
+def get_stock(page, goods_no):
+    open_page(page, detail_url(goods_no))
+    name = get_name(page)
+    res = read_options(page)
+
+    if res is None:
+        btns = [t.strip() for t in page.locator("button").all_inner_texts()]
+        if any(("바로구매" in t or "구매하기" in t) for t in btns):
+            return {"name": name, "soldout": False, "options": {}}
+        if any("품절" in t for t in btns):
+            return {"name": name, "soldout": True, "options": {}}
+        raise NoStockInfo("재고 상태를 판단할 수 없음 (구매 버튼을 못 찾음)")
+
+    options, debug = res
+    if not options:
+        raise RuntimeError(f"옵션 목록을 읽지 못함: {debug!r}")
+    return {"name": name, "soldout": all(options.values()), "options": options}
+
+
+def stock_label(so):
+    return "확인 못함" if so is None else ("🔴 품절" if so else "🟢 판매중")
+
+
+def describe_stock(s, g):
+    if s["options"]:
+        desc = ", ".join(f"{n}({'품절' if v else '판매중'})" for n, v in s["options"].items())
+        return f"{s['name']} ({g}) 옵션 {len(s['options'])}개: {desc}"
+    return f"{s['name']} ({g}) {'품절' if s['soldout'] else '판매중'} (옵션 없음)"
+
+
+def get_stock_with_429_retry(page, g, label):
+    """429가 뜨면 잠깐 기다렸다가 같은 상품을 다시 시도. 다른 오류는 그대로 올려보냄."""
+    for attempt in range(RETRY_429 + 1):
+        try:
+            return get_stock(page, g)
+        except NoStockInfo:
+            raise
+        except Exception as e:
+            is_429 = "HTTP 429" in str(e)
+            if not is_429 or attempt >= RETRY_429 or time.time() - T0 > TIME_LIMIT:
+                raise
+            wait = random.uniform(*WAIT_429)
+            log(f"{label} {g} 요청 제한(429) → {wait:.0f}초 후 다시 시도 ({attempt + 1}/{RETRY_429})")
+            time.sleep(wait)
+
+
+def run_stock(page, prev):
+    log(f"[재고 모드] 상품 {len(GOODS)}개")
+    stock, fails = {}, {}
+    no_info = set()
+    consec_fail = 0
+    stopped = None
+
+    for i, g in enumerate(GOODS, 1):
+        if time.time() - T0 > TIME_LIMIT:
+            stopped = f"시간 제한 ({i - 1}/{len(GOODS)}개 확인 후 중단)"
+            break
+        if consec_fail >= MAX_CONSEC_FAIL:
+            stopped = f"연속 {consec_fail}회 실패 → 접속 차단 의심 ({i - 1}/{len(GOODS)}개 확인 후 중단)"
+            break
+        label = f"[{i}/{len(GOODS)}]"
+        try:
+            stock[g] = get_stock_with_429_retry(page, g, label)
+            consec_fail = 0
+            log(f"{label} {describe_stock(stock[g], g)}")
+        except NoStockInfo as e:
+            consec_fail = 0
+            no_info.add(g)
+            fails[g] = str(e)[:100]
+            log(f"{label} {g} 판단 불가: {str(e)[:100]}")
+        except Exception as e:
+            consec_fail += 1
+            fails[g] = str(e)[:100]
+            log(f"{label} {g} 실패: {str(e)[:100]}")
+        time.sleep(random.uniform(*GAP))
+
+    # ---------- 실패한 상품 마지막에 한 번 더 시도 ----------
+    retry = [g for g in GOODS if g in fails and g not in no_info]
+    if retry and not stopped:
+        log(f"실패 상품 {len(retry)}개 재시도")
+        time.sleep(random.uniform(3, 5))
+        for g in retry:
+            if time.time() - T0 > TIME_LIMIT:
+                log("재시도 중 시간 제한 → 재시도 중단")
+                break
+            try:
+                stock[g] = get_stock_with_429_retry(page, g, "[재시도]")
+                fails.pop(g, None)
+                log(f"[재시도 성공] {describe_stock(stock[g], g)}")
+            except Exception as e:
+                fails[g] = str(e)[:100]
+                log(f"[재시도 실패] {g}: {str(e)[:100]}")
+            time.sleep(random.uniform(*GAP))
+
+    old_items = prev["items"]
+    prev_errors = prev["errors"]
+    now_items, now_errors, blocks = {}, {}, []
+
+    for g in GOODS:
+        old = old_items.get(g, {})
+        if g in stock:
+            s = stock[g]
+            cur = {"name": s["name"] or old.get("name", ""), "soldout": s["soldout"], "options": s["options"]}
+        else:
+            cur = {"name": old.get("name", ""), "soldout": old.get("soldout"), "options": old.get("options", {})}
+            if g in fails:
+                now_errors[g] = fails[g]
+            elif g in prev_errors:
+                now_errors[g] = prev_errors[g]
+        now_items[g] = cur
+
+        changed = (old.get("soldout"), old.get("options", {})) != (cur["soldout"], cur["options"])
+        if not (changed or ALWAYS) or g not in stock:
+            continue
+        tag = "⚠️ 변화 " if changed and g in old_items else ""
+        title = f"{cur['name']} ({g})" if cur["name"] else g
+        lines = [f"{tag}{title}"]
+        opts = cur["options"] or {}
+        if opts:
+            sold = sum(1 for v in opts.values() if v)
+            lines.append(f"  · 재고: 옵션 {len(opts)}개 중 {sold}개 품절 ({stock_label(cur['soldout'])})")
+            old_opts = old.get("options") or {}
+            for oname, v in opts.items():
+                mark = ""
+                if oname in old_opts and old_opts[oname] != v:
+                    mark = f" ← 변화 (이전: {'품절' if old_opts[oname] else '판매중'})"
+                lines.append(f"      - {oname}: {stock_label(v)}{mark}")
+        else:
+            prev_label = f" (이전: {stock_label(old.get('soldout'))})" if changed and g in old_items else ""
+            lines.append(f"  · 재고: {stock_label(cur['soldout'])}{prev_label}")
+        lines.append(f"  {detail_url(g)}")
+        blocks.append("\n".join(lines))
+
+    err_lines = []
+    for g, msg in fails.items():
+        if prev_errors.get(g) != msg:
+            label = now_items[g].get("name") or g
+            err_lines.append(f"{label} ({g}) 재고 실패: {msg}")
+    if stopped:
+        err_lines.append(f"중단: {stopped}")
+        log(f"중단: {stopped}")
+    if err_lines:
+        shown = err_lines[:10]
+        extra = f"\n...외 {len(err_lines) - 10}건" if len(err_lines) > 10 else ""
+        blocks.append("❗ 확인 실패/중단 (이전 값 유지)\n" + "\n".join(shown) + extra)
+
+    ts = now_ts()
+    if blocks:
+        send_slack(f"📦 [올리브영 재고 {ts}] 상품 {len(GOODS)}개 확인", blocks)
+    elif NOTIFY_NO_CHANGE:
+        post_slack(f"✅ [올리브영 재고 {ts}] 상품 {len(GOODS)}개 체크했으나 변경점이 없습니다. (재고 확인 {len(stock)}개)")
+    else:
+        log("변화 없음 (알림 생략)")
+
+    return {"items": now_items, "errors": now_errors}
+
+
+# ======================================================================
+
+def main():
+    if MODE not in ("stock", "rank"):
+        sys.exit(f"MODE 값이 잘못됐습니다: {MODE!r} (stock 또는 rank)")
+    if not GOODS:
+        sys.exit("상품번호가 없습니다. (GOODS_NO Secret 확인)")
+
+    prev = load_state(STATE_FILE)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
+        context = browser.new_context(user_agent=UA, locale="ko-KR", timezone_id="Asia/Seoul", viewport={"width": 1366, "height": 900})
+        context.add_init_script(STEALTH_JS)
+        page = context.new_page()
+        try:
+            if MODE == "rank":
+                new_state = run_rank(page, prev)
+            else:
+                new_state = run_stock(page, prev)
+        finally:
+            browser.close()
+
+    # 슬랙 전송이 성공한 뒤에만 상태 저장 (전송 실패 시 다음 실행에서 다시 알림)
+    STATE_FILE.write_text(json.dumps(new_state, ensure_ascii=False))
+    log(f"상태 저장 완료 ({STATE_FILE.name})")
+    log("끝")
+
+
+if __name__ == "__main__":
+    main()
