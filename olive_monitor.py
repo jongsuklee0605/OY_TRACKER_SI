@@ -393,7 +393,11 @@ def run_stock(page, prev):
             consec_fail += 1
             fails[g] = str(e)[:100]
             log(f"[{i}/{len(GOODS)}] {g} 실패: {str(e)[:100]}")
-        time.sleep(random.uniform(0.5, 1.2))
+            if "HTTP 429" in str(e) and consec_fail < MAX_CONSEC_FAIL:
+                wait = random.uniform(30, 60)
+                log(f"요청 제한(429) → {wait:.0f}초 대기 후 계속")
+                time.sleep(wait)
+        time.sleep(random.uniform(5, 8))
 
     old_items = prev["items"]
     prev_errors = prev["errors"]
