@@ -393,11 +393,7 @@ def run_stock(page, prev):
             consec_fail += 1
             fails[g] = str(e)[:100]
             log(f"[{i}/{len(GOODS)}] {g} 실패: {str(e)[:100]}")
-            if "HTTP 429" in str(e) and consec_fail < MAX_CONSEC_FAIL:
-                wait = random.uniform(30, 60)
-                log(f"요청 제한(429) → {wait:.0f}초 대기 후 계속")
-                time.sleep(wait)
-        time.sleep(random.uniform(5, 8))
+        time.sleep(random.uniform(0.5, 1.2))
 
     old_items = prev["items"]
     prev_errors = prev["errors"]
@@ -417,4 +413,79 @@ def run_stock(page, prev):
         now_items[g] = cur
 
         changed = (old.get("soldout"), old.get("options", {})) != (cur["soldout"], cur["options"])
-        if not (changed or ALWAYS) or g not in
+        if not (changed or ALWAYS) or g not in stock:
+            continue
+        tag = "⚠️ 변화 " if changed and g in old_items else ""
+        title = f"{cur['name']} ({g})" if cur["name"] else g
+        lines = [f"{tag}{title}"]
+        opts = cur["options"] or {}
+        if opts:
+            sold = sum(1 for v in opts.values() if v)
+            lines.append(f"  · 재고: 옵션 {len(opts)}개 중 {sold}개 품절 ({stock_label(cur['soldout'])})")
+            old_opts = old.get("options") or {}
+            for oname, v in opts.items():
+                mark = ""
+                if oname in old_opts and old_opts[oname] != v:
+                    mark = f" ← 변화 (이전: {'품절' if old_opts[oname] else '판매중'})"
+                lines.append(f"      - {oname}: {stock_label(v)}{mark}")
+        else:
+            prev_label = f" (이전: {stock_label(old.get('soldout'))})" if changed and g in old_items else ""
+            lines.append(f"  · 재고: {stock_label(cur['soldout'])}{prev_label}")
+        lines.append(f"  {detail_url(g)}")
+        blocks.append("\n".join(lines))
+
+    err_lines = []
+    for g, msg in fails.items():
+        if prev_errors.get(g) != msg:
+            label = now_items[g].get("name") or g
+            err_lines.append(f"{label} ({g}) 재고 실패: {msg}")
+    if stopped:
+        err_lines.append(f"중단: {stopped}")
+        log(f"중단: {stopped}")
+    if err_lines:
+        shown = err_lines[:10]
+        extra = f"\n...외 {len(err_lines) - 10}건" if len(err_lines) > 10 else ""
+        blocks.append("❗ 확인 실패/중단 (이전 값 유지)\n" + "\n".join(shown) + extra)
+
+    ts = now_ts()
+    if blocks:
+        send_slack(f"📦 [올리브영 재고 {ts}] 상품 {len(GOODS)}개 확인", blocks)
+    elif NOTIFY_NO_CHANGE:
+        post_slack(f"✅ [올리브영 재고 {ts}] 상품 {len(GOODS)}개 체크했으나 변경점이 없습니다. (재고 확인 {len(stock)}개)")
+    else:
+        log("변화 없음 (알림 생략)")
+
+    return {"items": now_items, "errors": now_errors}
+
+
+# ======================================================================
+
+def main():
+    if MODE not in ("stock", "rank"):
+        sys.exit(f"MODE 값이 잘못됐습니다: {MODE!r} (stock 또는 rank)")
+    if not GOODS:
+        sys.exit("상품번호가 없습니다. (GOODS_NO Secret 확인)")
+
+    prev = load_state(STATE_FILE)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
+        context = browser.new_context(user_agent=UA, locale="ko-KR", timezone_id="Asia/Seoul", viewport={"width": 1366, "height": 900})
+        context.add_init_script(STEALTH_JS)
+        page = context.new_page()
+        try:
+            if MODE == "rank":
+                new_state = run_rank(page, prev)
+            else:
+                new_state = run_stock(page, prev)
+        finally:
+            browser.close()
+
+    # 슬랙 전송이 성공한 뒤에만 상태 저장 (전송 실패 시 다음 실행에서 다시 알림)
+    STATE_FILE.write_text(json.dumps(new_state, ensure_ascii=False))
+    log(f"상태 저장 완료 ({STATE_FILE.name})")
+    log("끝")
+
+
+if __name__ == "__main__":
+    main()
