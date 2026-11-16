@@ -10,6 +10,7 @@ MODE=rank  : 랭킹 페이지에서 상품 순위 체크
   RANK_URLS          (선택) 랭킹 페이지, "이름|URL" 을 쉼표로 여러 개. 안 넣으면 전체 랭킹만
   ALWAYS_NOTIFY      (선택) 1이면 변화 없어도 매번 상세 알림
   NOTIFY_NO_CHANGE   (선택) 0이면 '변경점 없음' 알림을 보내지 않음 (기본 1)
+  TIME_LIMIT_SEC     (선택) 전체 실행 최대 시간(초). 기본 540(9분)
 """
 import json
 import os
@@ -38,9 +39,10 @@ STOCK_STATE_FILE = BASE_DIR / "olive_stock_state.json"   # 랭킹 모드에서 �
 SLACK_CHUNK = 3000
 
 NAV_TIMEOUT = 25000      # 페이지 하나를 여는 데 기다리는 최대 시간(ms)
-TIME_LIMIT = 9 * 60      # 전체 실행 최대 시간(초)
+TIME_LIMIT = int(os.environ.get("TIME_LIMIT_SEC", 9 * 60))   # 전체 실행 최대 시간(초)
 MAX_CONSEC_FAIL = 4      # 연속 실패가 이만큼이면 접속 차단으로 보고 중단
 RANK_RETRY = 3           # 랭킹 페이지 최대 시도 횟수
+STOCK_RETRY = 3          # 상품 페이지 403/429/타임아웃 시 최대 시도 횟수
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 STEALTH_JS = "Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); Object.defineProperty(navigator, 'languages', {get: () => ['ko-KR', 'ko', 'en-US']}); window.chrome = {runtime: {}};"
@@ -374,8 +376,29 @@ class NoStockInfo(Exception):
     pass
 
 
+def open_detail(page, goods_no):
+    """상품 페이지를 연다. 403/429/타임아웃이면 메인 페이지를 거쳐 재시도."""
+    for attempt in range(1, STOCK_RETRY + 1):
+        try:
+            open_page(page, detail_url(goods_no))
+            if attempt > 1:
+                log(f"{goods_no} 재시도 {attempt}회차에 성공")
+            return
+        except Exception as e:
+            msg = str(e)
+            retryable = "HTTP 403" in msg or "HTTP 429" in msg or "Timeout" in msg
+            if not retryable or attempt == STOCK_RETRY:
+                raise
+            log(f"{goods_no} 시도 {attempt}/{STOCK_RETRY} 실패({msg[:40]}) → 메인 페이지 거쳐 재시도")
+            try:
+                page.goto(MAIN_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+            except Exception:
+                pass
+            page.wait_for_timeout(random.randint(3000, 6000) * attempt)
+
+
 def get_stock(page, goods_no):
-    open_page(page, detail_url(goods_no))
+    open_detail(page, goods_no)
     name = get_name(page)
     brand = get_brand(page)
     res = read_options(page)
