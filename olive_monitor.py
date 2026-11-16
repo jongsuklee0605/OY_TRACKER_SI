@@ -49,6 +49,18 @@ KST = timezone(timedelta(hours=9))
 T0 = time.time()
 PRICE_RE = re.compile(r"\d[\d,]*\s*원")
 NOISE_RE = re.compile(r"^(예약|일시품절|품절|재입고|오늘드림|옵션을 선택|배송|구매수량|총\s)|배송시작|^\d+\s*%|^\(")
+NO_BRAND = "기타"
+# 상품 페이지의 브랜드 링크("청담쪽드기 >")를 찾는다. 상단 메뉴/푸터 안의 링크는 제외.
+BRAND_JS = """() => {
+  const sel = "a[href*='onlBrndCd'], a[href*='getBrandShopDetail'], a[href*='BrandShop']";
+  for (const a of document.querySelectorAll(sel)) {
+    if (a.closest('header, nav, footer')) continue;
+    if (!a.offsetParent) continue;
+    const t = (a.innerText || '').trim().replace(/\\s*[>›»]+\\s*$/, '').trim();
+    if (t && t.length <= 40) return t;
+  }
+  return '';
+}"""
 
 
 def log(msg):
@@ -122,6 +134,12 @@ def send_slack(header, blocks):
     for c in chunks:
         post_slack(c)
         time.sleep(1)
+
+
+def send_by_brand(prefix, by_brand, suffix=""):
+    """브랜드마다 별도 메시지로 보낸다 ('기타'는 맨 뒤). by_brand = {브랜드: [알림글자, ...]}"""
+    for brand in sorted(by_brand, key=lambda b: (b == NO_BRAND, b)):
+        send_slack(f"{prefix} 🏷️ {brand}{suffix}", by_brand[brand])
 
 
 # ======================================================================
@@ -204,10 +222,13 @@ def run_rank(page, prev):
             log(f"랭킹 '{name}' 최종 실패: {str(e)[:100]}")
         time.sleep(random.uniform(1.0, 2.0))
 
-    stock_names = {g: v.get("name", "") for g, v in load_state(STOCK_STATE_FILE)["items"].items()}
+    stock_state = load_state(STOCK_STATE_FILE)["items"]
+    stock_names = {g: v.get("name", "") for g, v in stock_state.items()}
+    stock_brands = {g: v.get("brand", "") for g, v in stock_state.items()}   # 브랜드는 재고 확인 때 저장된 값을 씀
     old_items = prev["items"]
 
     now_items, blocks = {}, []
+    by_brand = {}   # {브랜드: [상품별 알림글자]}  → 브랜드마다 별도 메시지로 전송
     for g in GOODS:
         old = old_items.get(g, {})
         old_ranks = old.get("ranks", {})
@@ -226,10 +247,13 @@ def run_rank(page, prev):
             else:
                 ranks[name] = old_ranks.get(name)
         pname = stock_names.get(g) or old.get("name") or rank_names.get(g, "")
-        now_items[g] = {"name": pname, "ranks": ranks}
+        brand = stock_brands.get(g) or old.get("brand", "")
+        now_items[g] = {"name": pname, "brand": brand, "ranks": ranks}
         if diffs:
             title = f"{pname} ({g})" if pname else g
-            blocks.append(title + "\n" + "\n".join(diffs) + f"\n  {detail_url(g)}")
+            by_brand.setdefault(brand or NO_BRAND, []).append(
+                title + "\n" + "\n".join(diffs) + f"\n  {detail_url(g)}"
+            )
 
     # 오류: 새로 생긴 것만 알림, 복구되면 알림
     prev_errors = prev["errors"]
@@ -244,8 +268,10 @@ def run_rank(page, prev):
         blocks.append("\n".join(err_lines))
 
     ts = now_ts()
-    if blocks:
-        send_slack(f"📊 [올리브영 랭킹 {ts}] 순위 변동", blocks)
+    if by_brand or blocks:
+        send_by_brand(f"📊 [올리브영 랭킹 {ts}]", by_brand, suffix=" 순위 변동")   # 브랜드별 별도 메시지
+        if blocks:
+            send_slack(f"📊 [올리브영 랭킹 {ts}] 확인 상태", blocks)   # 랭킹 페이지 실패/복구 안내
     elif NOTIFY_NO_CHANGE:
         in_rank = sum(1 for v in now_items.values() if any(v["ranks"].values()))
         note = f" (확인 실패 중: {', '.join(fails)})" if fails else ""
@@ -273,6 +299,14 @@ def get_name(page):
     except Exception:
         og = ""
     return clean_name(og or page.title())
+
+
+def get_brand(page):
+    """브랜드명을 읽는다. 못 읽으면 빈 글자."""
+    try:
+        return page.evaluate(BRAND_JS) or ""
+    except Exception:
+        return ""
 
 
 def parse_options(text):
@@ -343,20 +377,21 @@ class NoStockInfo(Exception):
 def get_stock(page, goods_no):
     open_page(page, detail_url(goods_no))
     name = get_name(page)
+    brand = get_brand(page)
     res = read_options(page)
 
     if res is None:
         btns = [t.strip() for t in page.locator("button").all_inner_texts()]
         if any(("바로구매" in t or "구매하기" in t) for t in btns):
-            return {"name": name, "soldout": False, "options": {}}
+            return {"name": name, "brand": brand, "soldout": False, "options": {}}
         if any("품절" in t for t in btns):
-            return {"name": name, "soldout": True, "options": {}}
+            return {"name": name, "brand": brand, "soldout": True, "options": {}}
         raise NoStockInfo("재고 상태를 판단할 수 없음 (구매 버튼을 못 찾음)")
 
     options, debug = res
     if not options:
         raise RuntimeError(f"옵션 목록을 읽지 못함: {debug!r}")
-    return {"name": name, "soldout": all(options.values()), "options": options}
+    return {"name": name, "brand": brand, "soldout": all(options.values()), "options": options}
 
 
 def stock_label(so):
@@ -380,6 +415,8 @@ def run_stock(page, prev):
             stock[g] = get_stock(page, g)
             consec_fail = 0
             s = stock[g]
+            if len(stock) <= 3:  # 처음 몇 개는 상품명/브랜드가 맞게 읽히는지 로그로 확인
+                log(f"예시 {g}: 상품명 '{s['name']}' / 브랜드 '{s['brand']}'")
             if s["options"]:
                 desc = ", ".join(f"{n}({'품절' if v else '판매중'})" for n, v in s["options"].items())
                 log(f"[{i}/{len(GOODS)}] {s['name']} ({g}) 옵션 {len(s['options'])}개: {desc}")
@@ -398,14 +435,17 @@ def run_stock(page, prev):
     old_items = prev["items"]
     prev_errors = prev["errors"]
     now_items, now_errors, blocks = {}, {}, []
+    by_brand = {}   # {브랜드: [상품별 알림글자]}  → 브랜드마다 별도 메시지로 전송
 
     for g in GOODS:
         old = old_items.get(g, {})
         if g in stock:
             s = stock[g]
-            cur = {"name": s["name"] or old.get("name", ""), "soldout": s["soldout"], "options": s["options"]}
+            cur = {"name": s["name"] or old.get("name", ""), "brand": s.get("brand") or old.get("brand", ""),
+                   "soldout": s["soldout"], "options": s["options"]}
         else:
-            cur = {"name": old.get("name", ""), "soldout": old.get("soldout"), "options": old.get("options", {})}
+            cur = {"name": old.get("name", ""), "brand": old.get("brand", ""),
+                   "soldout": old.get("soldout"), "options": old.get("options", {})}
             if g in fails:
                 now_errors[g] = fails[g]
             elif g in prev_errors:
@@ -432,7 +472,7 @@ def run_stock(page, prev):
             prev_label = f" (이전: {stock_label(old.get('soldout'))})" if changed and g in old_items else ""
             lines.append(f"  · 재고: {stock_label(cur['soldout'])}{prev_label}")
         lines.append(f"  {detail_url(g)}")
-        blocks.append("\n".join(lines))
+        by_brand.setdefault(cur.get("brand") or NO_BRAND, []).append("\n".join(lines))
 
     err_lines = []
     for g, msg in fails.items():
@@ -448,8 +488,10 @@ def run_stock(page, prev):
         blocks.append("❗ 확인 실패/중단 (이전 값 유지)\n" + "\n".join(shown) + extra)
 
     ts = now_ts()
-    if blocks:
-        send_slack(f"📦 [올리브영 재고 {ts}] 상품 {len(GOODS)}개 확인", blocks)
+    if by_brand or blocks:
+        send_by_brand(f"📦 [올리브영 재고 {ts}]", by_brand)   # 브랜드별 별도 메시지
+        if blocks:
+            send_slack(f"📦 [올리브영 재고 {ts}] 상품 {len(GOODS)}개 확인", blocks)   # 실패/중단 안내
     elif NOTIFY_NO_CHANGE:
         post_slack(f"✅ [올리브영 재고 {ts}] 상품 {len(GOODS)}개 체크했으나 변경점이 없습니다. (재고 확인 {len(stock)}개)")
     else:
