@@ -2,17 +2,17 @@ name: olive-stock
 
 on:
   schedule:
-    - cron: "3-59/10 * * * *"   # 예비용. 정각(:00)을 피하면 지연이 줄어듦
+    - cron: "3-59/10 * * * *"   # 10분마다. 정각(:00)을 피하면 지연이 줄어듦. 30분 간격이면 "7,37 * * * *"
   workflow_dispatch: {}
 
 concurrency:
   group: olive-stock
-  cancel-in-progress: false
+  cancel-in-progress: false      # 이전 실행이 안 끝났으면 다음 실행은 대기 (겹치지 않음)
 
 jobs:
   run:
     runs-on: ubuntu-24.04
-    timeout-minutes: 8           # 다음 실행(10분 후)과 겹치지 않도록
+    timeout-minutes: 15          # 스크립트(최대 9분) + 설치 시간 여유
     strategy:
       fail-fast: false
       matrix:
@@ -49,6 +49,7 @@ jobs:
         env:
           MODE: stock
           SHARD: ${{ matrix.shard }}
+          NOTIFY_NO_CHANGE: "0"    # 변화 없을 땐 슬랙 안 보냄
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_STOCK }}
           GOODS_NO_ALL: ${{ secrets.GOODS_NO }}
         run: |
