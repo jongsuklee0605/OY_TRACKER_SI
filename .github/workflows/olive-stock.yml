@@ -2,7 +2,7 @@ name: olive-stock
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "3-59/10 * * * *"   # 예비용. 정각(:00)을 피하면 지연이 줄어듦
   workflow_dispatch: {}
 
 concurrency:
@@ -12,7 +12,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 8           # 다음 실행(10분 후)과 겹치지 않도록
     strategy:
       fail-fast: false
       matrix:
@@ -41,10 +41,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: olive_stock_state.json
-          key: olive-stock-s${{ matrix.shard }}-${{ github.run_id }}
+          key: olive-stock-s${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             olive-stock-s${{ matrix.shard }}-
-            olive-stock-
 
       - name: Run monitor
         env:
@@ -53,17 +52,22 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_STOCK }}
           GOODS_NO_ALL: ${{ secrets.GOODS_NO }}
         run: |
-          export GOODS_NO=$(python -c "
-          import os
+          set -euo pipefail
+          GOODS_NO=$(python -c "
+          import os, zlib
           g = list(dict.fromkeys(x.strip() for x in os.environ['GOODS_NO_ALL'].split(',') if x.strip()))
           s, n = int(os.environ['SHARD']), int(os.environ['SHARDS'])
-          print(','.join(g[s::n]))
+          print(','.join(x for x in g if zlib.crc32(x.encode()) % n == s))
           ")
+          if [ -z "$GOODS_NO" ]; then
+            echo "No items for shard $SHARD"; exit 0
+          fi
+          export GOODS_NO
           python olive_monitor.py
 
       - name: Save state
-        if: always()
+        if: success() && hashFiles('olive_stock_state.json') != ''
         uses: actions/cache/save@v4
         with:
           path: olive_stock_state.json
-          key: olive-stock-s${{ matrix.shard }}-${{ github.run_id }}
+          key: olive-stock-s${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
