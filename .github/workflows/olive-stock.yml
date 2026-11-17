@@ -50,6 +50,7 @@ jobs:
         env:
           MODE: stock
           SHARD: ${{ matrix.shard }}
+          SUMMARY_FILE: summary.json
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_STOCK }}
           GOODS_NO_ALL: ${{ secrets.GOODS_NO }}
         run: |
@@ -67,3 +68,58 @@ jobs:
         with:
           path: olive_stock_state.json
           key: olive-stock-s${{ matrix.shard }}-${{ github.run_id }}
+
+      - name: Upload summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: summary-${{ matrix.shard }}
+          path: summary.json
+          if-no-files-found: ignore
+          retention-days: 1
+
+  notify:
+    needs: run
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: summary-*
+          path: summaries
+
+      - name: Send combined message
+        env:
+          SHARDS: 4
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_STOCK }}
+        run: |
+          python3 - <<'EOF'
+          import glob, json, os, urllib.request
+          from datetime import datetime, timezone, timedelta
+
+          n = int(os.environ["SHARDS"])
+          res = [json.load(open(f)) for f in glob.glob("summaries/*/summary.json")]
+          missing = n - len(res)
+          ts = datetime.now(timezone(timedelta(hours=9))).strftime("%m/%d %H:%M")
+          goods = sum(r["goods"] for r in res)
+          checked = sum(r["checked"] for r in res)
+
+          if missing:
+              text = (f"❗ [올리브영 재고 {ts}] {n}개 묶음 중 {missing}개가 결과 없이 끝났습니다. "
+                      f"Actions 로그를 확인해 주세요. (나머지 상품 {goods}개는 정상 처리)")
+          elif any(r["issue"] for r in res):
+              print("이슈가 있는 묶음이 이미 상세 알림을 보냄 → 통합 알림 생략")
+              raise SystemExit
+          else:
+              text = f"✅ [올리브영 재고 {ts}] 상품 {goods}개 체크했으나 변경점이 없습니다. (재고 확인 {checked}개)"
+              lines = [l for r in res for l in r.get("lines", [])]
+              if lines:
+                  text += "\n" + "\n".join(lines)
+
+          req = urllib.request.Request(os.environ["SLACK_WEBHOOK_URL"],
+                                       data=json.dumps({"text": text}).encode(),
+                                       headers={"Content-Type": "application/json"})
+          urllib.request.urlopen(req, timeout=15)
+          print("슬랙 전송 완료")
+          EOF
