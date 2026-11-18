@@ -30,7 +30,7 @@ WEBHOOK = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
 RAW_GOODS = os.environ.get("GOODS_NO", "")
 GOODS = list(dict.fromkeys(g.strip() for g in RAW_GOODS.split(",") if g.strip()))
 ALWAYS = os.environ.get("ALWAYS_NOTIFY") == "1"
-NOTIFY_NO_CHANGE = os.environ.get("NOTIFY_NO_CHANGE", "1") != "0"
+NOTIFY_NO_CHANGE = os.environ.get("NOTIFY_NO_CHANGE", "0") == "1"
 SUMMARY_FILE = os.environ.get("SUMMARY_FILE", "").strip()
 
 DEFAULT_RANK = "전체|https://www.oliveyoung.co.kr/store/main/getBestList.do"
